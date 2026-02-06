@@ -1,0 +1,189 @@
+#!/bin/bash
+# 保留严格模式，同时用标准语法避免兼容问题
+set -euo pipefail
+IFS=$'\n\t'
+
+# 初始化所有变量（显式赋值，避免set -u报错）
+opt_show_raw=0
+opt_count_col=0
+opt_only_file=0
+opt_only_dir=0
+opt_no_hidden=0
+target_path="./"
+pipe_input=""
+hidden_note="含隐藏"
+file_count=0
+dir_count=0
+color_dir="\033[34m"
+color_file="\033[32m"
+color_reset="\033[0m"
+
+# 帮助信息
+show_help() {
+    cat << EOF
+用法: count [选项] [路径/通配符]  或  命令 | count [选项]
+功能: 管道统计行/列 | 路径统计文件/文件夹 | 兼容参数组合/通配符/隐藏过滤
+选项：
+  管道模式：-v(底部显原生) -V(顶部显原生) -c(统计列)
+  路径模式：-f(仅文件) -d(仅文件夹) -n(过滤隐藏)
+  通用：-h/--help(帮助)，参数可组合(-fn=-f-n)，参数与路径可调换
+示例：
+  ll | count -Vc  # 顶部统计行+列，再显ll原生内容
+  count -fn /home/jim  # 统计家目录非隐藏文件
+  count ~/*.py    # 统计家目录py文件
+EOF
+    exit 0
+}
+
+# 解析参数（标准语法，无兼容问题）
+parse_args() {
+    local path_candidate=""
+    for arg in "$@"; do
+        if [ "$arg" = "--help" ] || [ "$arg" = "-h" ]; then
+            show_help
+        elif [ "${arg:0:1}" = "-" ]; then
+            if [ "${arg:1:1}" = "-" ]; then
+                # 长选项
+                local opt=${arg#--}
+                case "$opt" in
+                    verbose) opt_show_raw=1 ;;
+                    VERBOSE) opt_show_raw=2 ;;
+                    col) opt_count_col=1 ;;
+                    file) opt_only_file=1 ;;
+                    dir) opt_only_dir=1 ;;
+                    no-hidden) opt_no_hidden=1; hidden_note="非隐藏" ;;
+                    *) echo "错误：未知长选项 $arg" >&2; show_help ;;
+                esac
+            else
+                # 短选项（支持组合，标准for循环）
+                local opt_chars=${arg#-}
+                local len=${#opt_chars}
+                for ((i=0; i<len; i++)); do
+                    local c=${opt_chars:$i:1}
+                    case "$c" in
+                        v) opt_show_raw=1 ;;
+                        V) opt_show_raw=2 ;;
+                        c) opt_count_col=1 ;;
+                        f) opt_only_file=1 ;;
+                        d) opt_only_dir=1 ;;
+                        n) opt_no_hidden=1; hidden_note="非隐藏" ;;
+                        h) show_help ;;
+                        *) echo "错误：未知短选项 -$c" >&2; show_help ;;
+                    esac
+                done
+            fi
+        else
+            path_candidate="$arg"
+        fi
+    done
+    # 赋值目标路径，有指定则用，无则默认当前目录
+    if [ -n "$path_candidate" ]; then
+        target_path="$path_candidate"
+    fi
+    # 互斥检查
+    if [ $opt_only_file -eq 1 ] && [ $opt_only_dir -eq 1 ]; then
+        echo "错误：-f和-d不能同时使用！" >&2
+        exit 1
+    fi
+}
+
+# 管道模式处理（标准语法，无语法错）
+handle_pipe() {
+    if [ ! -t 0 ]; then
+        # 读取管道输入，屏蔽报错
+        pipe_input=$(cat - 2>/dev/null) || true
+        # 统计行数，标准语法去空格
+        line_count=$(echo "$pipe_input" | wc -l | tr -d ' \t\n\r')
+        col_count=0
+        # 统计列数
+        if [ $opt_count_col -eq 1 ] && [ -n "$pipe_input" ]; then
+            first_line=$(echo "$pipe_input" | head -n1 | xargs 2>/dev/null) || true
+            col_count=$(echo "$first_line" | wc -w | tr -d ' \t\n\r')
+        fi
+        # 输出逻辑
+        if [ $opt_show_raw -eq 2 ]; then
+            echo -e "=== 统计结果 ==="
+            echo "总行数: $line_count"
+            [ $opt_count_col -eq 1 ] && echo "总列数: $col_count"
+            echo -e "=== 原生输出 ==="
+            echo "$pipe_input"
+        elif [ $opt_show_raw -eq 1 ]; then
+            echo -e "=== 原生输出 ==="
+            echo "$pipe_input"
+            echo -e "=== 统计结果 ==="
+            echo "总行数: $line_count"
+            [ $opt_count_col -eq 1 ] && echo "总列数: $col_count"
+        else
+            echo "总行数: $line_count"
+            [ $opt_count_col -eq 1 ] && echo "总列数: $col_count"
+        fi
+        exit 0
+    fi
+}
+
+# 路径模式处理（核心：删掉所有易报错的语法，用标准[]判断）
+handle_path() {
+    local items=()
+    # 通配符处理，标准语法
+    shopt -s nullglob globstar
+    eval "items=($target_path)" 2>/dev/null || true
+    shopt -u nullglob globstar
+
+    # 无匹配项提示
+    if [ ${#items[@]} -eq 0 ]; then
+        echo -e "⚠️  提示：路径 '$target_path' 无匹配项或无访问权限"
+        exit 0
+    fi
+
+    # 遍历统计，全部用标准[ ]条件判断，无语法错
+    for item in "${items[@]}"; do
+        # 跳过不存在的项
+        if [ ! -e "$item" ] && [ ! -L "$item" ]; then
+            continue
+        fi
+        # 过滤隐藏项
+        if [ $opt_no_hidden -eq 1 ]; then
+            item_name=$(basename "$item" 2>/dev/null) || true
+            if [ "${item_name:0:1}" = "." ]; then
+                continue
+            fi
+        fi
+        # 统计文件（普通文件+软链接）
+        if [ -f "$item" ] 2>/dev/null || [ -L "$item" ] 2>/dev/null; then
+            file_count=$((file_count + 1))
+        # 统计文件夹（真实目录，排除软链接）
+        elif [ -d "$item" ] 2>/dev/null && [ ! -L "$item" ] 2>/dev/null; then
+            dir_count=$((dir_count + 1))
+        fi
+    done
+
+    # 输出统计结果，标准语法
+    if [ $opt_only_file -eq 1 ]; then
+        echo -e "📄 仅统计文件（$hidden_note）: ${color_file}$file_count${color_reset} 个"
+        echo -e "📁 统计路径: $target_path"
+    elif [ $opt_only_dir -eq 1 ]; then
+        echo -e "📂 仅统计文件夹（$hidden_note）: ${color_dir}$dir_count${color_reset} 个"
+        echo -e "📁 统计路径: $target_path"
+    else
+        echo -e "📊 统计结果（$hidden_note）| 路径: $target_path"
+        echo -e "├─ 📂 文件夹: ${color_dir}$dir_count${color_reset} 个"
+        echo -e "└─ 📄 文件: ${color_file}$file_count${color_reset} 个"
+    fi
+    # 计数为0的提示
+    if [ $file_count -eq 0 ] && [ $dir_count -eq 0 ]; then
+        echo -e "⚠️  提示：无符合条件的文件/文件夹（或无访问权限）"
+    fi
+}
+
+# 主逻辑（标准语法，兜底报错）
+main() {
+    parse_args "$@" 2>/dev/null || true
+    handle_pipe
+    handle_path
+}
+
+# 执行主逻辑，捕获所有报错
+main "$@" 2>/dev/null || {
+    echo -e "❌ 执行错误！请运行 \`$0 -h\` 查看帮助"
+    exit 1
+}

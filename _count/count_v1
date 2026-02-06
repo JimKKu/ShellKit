@@ -1,0 +1,220 @@
+#!/bin/bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# 初始化变量
+opt_show_raw=0          # 0=不显示原生输出 1=底部显示 2=顶部显示
+opt_count_col=0         # 是否统计列
+opt_only_file=0         # 仅统计文件
+opt_only_dir=0          # 仅统计文件夹
+opt_no_hidden=0         # 过滤隐藏目录/文件
+target_path=""          # 目标路径/通配符
+pipe_input=""           # 管道输入内容
+
+# 帮助信息函数
+show_help() {
+    cat << EOF
+用法: count [选项] [路径/通配符]  或  命令 | count [选项]
+功能: 1.管道统计行/列  2.路径统计文件/文件夹  3.支持参数组合/调换/通配符/隐藏过滤
+
+### 管道模式选项（命令 | count [选项]）
+  -v, --verbose    显示原生输出，统计信息在底部
+  -V, --VERBOSE    显示原生输出，统计信息在顶部
+  -c, --col        统计列数（可与-v/V组合，同时统计行+列）
+
+### 路径模式选项（count [选项] 路径）
+  -f, --file       仅统计文件（不包含文件夹）
+  -d, --dir        仅统计文件夹（不包含文件）
+  -n, --no-hidden  过滤隐藏目录/文件（名称以.开头的）
+  无上述选项       默认统计：文件+文件夹（包含隐藏）
+
+### 通用规则
+1. 参数可组合：-fn = -f -n = -nf，大小写敏感（-v≠-V）
+2. 参数与路径可调换：count -f /home = count /home -f
+3. 支持通配符：count /home/*.py  统计.py结尾文件
+4. 路径默认当前目录：count 等价于 count ./
+5. 隐藏判定：名称以.开头（如.ssh、.bashrc），-n会过滤
+
+### 示例
+#### 管道模式
+ll | count              # 仅统计ll输出的行数
+ll | count -v           # 显示ll原生内容 + 底部统计行数
+ls | count -Vc          # 显示ls原生内容 + 顶部统计行+列
+ps aux | count -c       # 仅统计ps aux输出的列数
+
+#### 路径模式
+count /home             # 统计/home下文件+文件夹（含隐藏）
+count -f /home          # 仅统计/home下文件（含隐藏）
+count /home -d -n       # 仅统计/home下非隐藏文件夹
+count -fn ~/*.sh        # 统计家目录下非隐藏的.sh脚本文件
+count ./test*           # 统计当前目录下test开头的文件/文件夹
+EOF
+    exit 0
+}
+
+# 解析命令行参数（核心：支持组合参数、参数路径调换）
+parse_args() {
+    local args=("$@")
+    local path_candidates=()
+    local opt_candidates=()
+
+    # 第一步：分离参数和路径候选（路径/通配符：非-开头，或通配符*?[]）
+    for arg in "${args[@]}"; do
+        if [[ "$arg" == --help || "$arg" == -h ]]; then
+            show_help
+        elif [[ "$arg" == -* ]]; then
+            opt_candidates+=("$arg")
+        else
+            path_candidates+=("$arg")
+        fi
+    done
+
+    # 第二步：处理路径候选（多个路径取最后一个，兼容通配符）
+    if [[ ${#path_candidates[@]} -gt 0 ]]; then
+        target_path="${path_candidates[-1]}"
+    else
+        target_path="./"  # 默认当前目录
+    fi
+
+    # 第三步：解析所有选项（支持组合参数，如-ab拆分为-a -b）
+    for opt in "${opt_candidates[@]}"; do
+        # 去掉开头的-，遍历每个字符（短选项）；长选项单独处理
+        local opt_chars="${opt#-}"
+        if [[ "$opt" == --* ]]; then
+            # 处理长选项
+            case "$opt_chars" in
+                verbose) opt_show_raw=1 ;;
+                VERBOSE) opt_show_raw=2 ;;
+                col) opt_count_col=1 ;;
+                file) opt_only_file=1 ;;
+                dir) opt_only_dir=1 ;;
+                no-hidden) opt_no_hidden=1 ;;
+                *) echo "错误：未知长选项 --$opt_chars" >&2; show_help ;;
+            esac
+        else
+            # 处理短选项（组合如fn拆分为f n）
+            for ((i=0; i<${#opt_chars}; i++)); do
+                local c="${opt_chars:$i:1}"
+                case "$c" in
+                    v) opt_show_raw=1 ;;
+                    V) opt_show_raw=2 ;;
+                    c) opt_count_col=1 ;;
+                    f) opt_only_file=1 ;;
+                    d) opt_only_dir=1 ;;
+                    n) opt_no_hidden=1 ;;
+                    h) show_help ;;
+                    *) echo "错误：未知短选项 -$c" >&2; show_help ;;
+                esac
+            done
+        fi
+    done
+
+    # 互斥选项检查：-f和-d不能同时用
+    if [[ $opt_only_file -eq 1 && $opt_only_dir -eq 1 ]]; then
+        echo "错误：-f/--file 和 -d/--dir 不能同时使用！" >&2
+        exit 1
+    fi
+}
+
+# 管道模式处理（统计行/列，支持显示原生内容）
+handle_pipe() {
+    # 读取管道输入（如果有）
+    if [[ ! -t 0 ]]; then
+        pipe_input=$(cat -)
+        local line_count=$(echo "$pipe_input" | wc -l | tr -d ' ')
+        local col_count=0
+
+        # 统计列数（取第一行，按空白分割统计，兼容ls/ll的列）
+        if [[ $opt_count_col -eq 1 && -n "$pipe_input" ]]; then
+            local first_line=$(echo "$pipe_input" | head -n1 | xargs)
+            col_count=$(echo "$first_line" | wc -w | tr -d ' ')
+        fi
+
+        # 显示原生内容（按-v/V规则）
+        if [[ $opt_show_raw -eq 2 ]]; then
+            # -V：先统计，再原生内容
+            echo -e "=== 统计结果 ==="
+            echo "总行数: $line_count"
+            [[ $opt_count_col -eq 1 ]] && echo "总列数: $col_count"
+            echo -e "=== 原生输出 ==="
+            echo "$pipe_input"
+        elif [[ $opt_show_raw -eq 1 ]]; then
+            # -v：先原生内容，再统计
+            echo -e "=== 原生输出 ==="
+            echo "$pipe_input"
+            echo -e "=== 统计结果 ==="
+            echo "总行数: $line_count"
+            [[ $opt_count_col -eq 1 ]] && echo "总列数: $col_count"
+        else
+            # 无-v/V：仅统计
+            echo "总行数: $line_count"
+            [[ $opt_count_col -eq 1 ]] && echo "总列数: $col_count"
+        fi
+        exit 0
+    fi
+}
+
+# 路径模式处理（统计文件/文件夹，支持通配符、隐藏过滤、-f/-d）
+handle_path() {
+    local items=()
+    local file_count=0
+    local dir_count=0
+
+    # 处理通配符（如果匹配不到，避免生成空字符串）
+    shopt -s nullglob
+    items=($target_path)
+    shopt -u nullglob
+
+    # 如果无匹配项，提示并退出
+    if [[ ${#items[@]} -eq 0 ]]; then
+        echo "提示：路径/通配符 '$target_path' 无匹配项"
+        exit 0
+    fi
+
+    # 遍历所有匹配项，统计文件/文件夹
+    for item in "${items[@]}"; do
+        # 跳过不存在的项（防御性处理）
+        [[ ! -e "$item" ]] && continue
+
+        # 过滤隐藏项（-n/--no-hidden：名称以.开头）
+        if [[ $opt_no_hidden -eq 1 ]]; then
+            local item_name=$(basename "$item")
+            [[ "$item_name" == .* ]] && continue
+        fi
+
+        # 统计文件
+        if [[ -f "$item" || -L "$item" ]]; then  # 包含普通文件、软链接
+            ((file_count++))
+        # 统计文件夹
+        elif [[ -d "$item" ]]; then
+            ((dir_count++))
+        fi
+    done
+
+    # 根据参数输出统计结果
+    if [[ $opt_only_file -eq 1 ]]; then
+        echo "仅统计文件（$( [[ $opt_no_hidden -eq 1 ]] && echo "非隐藏" || echo "含隐藏" )）: $file_count 个"
+        echo "统计路径: $target_path"
+    elif [[ $opt_only_dir -eq 1 ]]; then
+        echo "仅统计文件夹（$( [[ $opt_no_hidden -eq 1 ]] && echo "非隐藏" || echo "含隐藏" )）: $dir_count 个"
+        echo "统计路径: $target_path"
+    else
+        echo "统计结果（$( [[ $opt_no_hidden -eq 1 ]] && echo "非隐藏" || echo "含隐藏" )）:"
+        echo "├─ 文件夹: $dir_count 个"
+        echo "└─ 文件: $file_count 个"
+        echo "统计路径: $target_path"
+    fi
+}
+
+# 主逻辑
+main() {
+    # 解析参数
+    parse_args "$@"
+    # 先检查管道输入，优先处理管道模式
+    handle_pipe
+    # 无管道则处理路径模式
+    handle_path
+}
+
+# 执行主逻辑
+main "$@"

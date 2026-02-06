@@ -1,0 +1,198 @@
+#!/bin/bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# 初始化所有变量（显式赋值，避免set -u报错）
+opt_show_raw=0  ; opt_count_col=0
+opt_only_file=0 ; opt_only_dir=0 ; opt_no_hidden=0
+target_path="./"; hidden_note="含隐藏"
+file_count=0    ; dir_count=0
+# 彩色输出（终端通用，不喜欢可删除所有\033相关字符）
+color_dir="\033[34m"; color_file="\033[32m"; color_reset="\033[0m"
+
+# 帮助信息（精简清晰，标注参数适用模式）
+show_help() {
+    cat << EOF
+🔧 用法: count [选项] [路径/通配符]  或  命令 | count [选项]
+📌 核心功能：1.管道统计行/列  2.路径统计「内部」文件/文件夹（支持通配符）
+💡 通用规则：参数可组合(-fn=-f-n) | 参数与路径可调换 | 自动跳过无权限项
+
+【管道模式专属选项】（仅命令|count时生效）
+  -v  显示原生输出，统计信息在底部
+  -V  显示原生输出，统计信息在顶部
+  -c  统计列数（可与-v/V组合，同时统计行+列）
+
+【路径模式专属选项】（仅count [选项] 路径时生效）
+  -f  仅统计文件（不包含文件夹）
+  -d  仅统计文件夹（不包含文件）
+  -n  过滤隐藏项（名称以.开头的文件/文件夹）
+
+【通用选项】
+  -h/--help  显示本帮助信息
+
+📝 常用示例
+  管道模式：ll | count        # 仅统计ll输出行数
+            ll | count -Vc    # 顶部统计行+列，后显原生内容
+            ps aux | count -c # 仅统计ps输出列数
+  路径模式：count /home/jim   # 统计jim目录「内部」所有文件+文件夹
+            count -fn ~/      # 统计家目录「内部」非隐藏文件
+            count ~/*.py      # 统计家目录下所有.py后缀文件
+            count -dn ./DevCodes # 统计DevCodes内非隐藏文件夹
+EOF
+    exit 0
+}
+
+# 解析参数（核心：分离管道/路径参数，路径模式忽略-v/V/c）
+parse_args() {
+    local path_candidate=""
+    for arg in "$@"; do
+        if [ "$arg" = "--help" ] || [ "$arg" = "-h" ]; then show_help; fi
+        # 匹配选项（-开头）
+        if [ "${arg:0:1}" = "-" ]; then
+            if [ "${arg:1:1}" = "-" ]; then
+                # 长选项（仅做兼容，推荐用短选项）
+                local opt=${arg#--}
+                case "$opt" in
+                    verbose|VERBOSE|col) : ;; # 路径模式忽略管道长选项
+                    file) opt_only_file=1 ;;
+                    dir) opt_only_dir=1 ;;
+                    no-hidden) opt_no_hidden=1; hidden_note="非隐藏" ;;
+                    *) echo "错误：未知长选项 $arg" >&2; show_help ;;
+                esac
+            else
+                # 短选项（支持组合，路径模式自动忽略-v/V/c）
+                local opt_chars=${arg#-}
+                local len=${#opt_chars}
+                for ((i=0; i<len; i++)); do
+                    local c=${opt_chars:$i:1}
+                    case "$c" in
+                        v|V|c) : ;; # 关键：路径模式忽略管道专属短选项，无任何提示
+                        f) opt_only_file=1 ;;
+                        d) opt_only_dir=1 ;;
+                        n) opt_no_hidden=1; hidden_note="非隐藏" ;;
+                        h) show_help ;;
+                        *) echo "错误：未知短选项 -$c" >&2; show_help ;;
+                    esac
+                done
+            fi
+        else
+            path_candidate="$arg" # 提取路径（多个取最后一个）
+        fi
+    done
+    # 赋值目标路径：有指定则用，无则默认当前目录
+    [ -n "$path_candidate" ] && target_path="$path_candidate"
+    # 互斥检查：-f和-d不能同时用
+    if [ $opt_only_file -eq 1 ] && [ $opt_only_dir -eq 1 ]; then
+        echo "❌ 错误：-f(仅文件) 和 -d(仅文件夹) 不能同时使用！" >&2
+        exit 1
+    fi
+}
+
+# 管道模式处理（仅命令|count时生效，-v/-V/c正常工作）
+handle_pipe() {
+    if [ ! -t 0 ]; then
+        pipe_input=$(cat - 2>/dev/null) || true
+        line_count=$(echo "$pipe_input" | wc -l | tr -d ' \t\n\r')
+        col_count=0
+        # 统计列数（取第一行按空白分割，兼容ls/ll/ps等）
+        if [ $opt_count_col -eq 1 ] && [ -n "$pipe_input" ]; then
+            first_line=$(echo "$pipe_input" | head -n1 | xargs 2>/dev/null) || true
+            col_count=$(echo "$first_line" | wc -w | tr -d ' \t\n\r')
+        fi
+        # 按-v/V规则输出原生内容+统计
+        if [ $opt_show_raw -eq 2 ]; then
+            echo -e "=== 统计结果 ==="
+            echo "总行数: $line_count" && [ $opt_count_col -eq 1 ] && echo "总列数: $col_count"
+            echo -e "=== 原生输出 ===" && echo "$pipe_input"
+        elif [ $opt_show_raw -eq 1 ]; then
+            echo -e "=== 原生输出 ===" && echo "$pipe_input"
+            echo -e "=== 统计结果 ==="
+            echo "总行数: $line_count" && [ $opt_count_col -eq 1 ] && echo "总列数: $col_count"
+        else
+            echo "总行数: $line_count" && [ $opt_count_col -eq 1 ] && echo "总列数: $col_count"
+        fi
+        exit 0
+    fi
+}
+
+# 路径模式处理（核心修复：统计目录「内部」子项，通配符正常匹配）
+handle_path() {
+    local items=()
+    # 处理通配符/路径：开启nullglob避免无匹配时返回原字符串
+    shopt -s nullglob globstar
+    eval "items=($target_path)" 2>/dev/null || true
+    shopt -u nullglob globstar
+
+    # 无匹配项提示
+    if [ ${#items[@]} -eq 0 ]; then
+        echo -e "⚠️  提示：路径/通配符 '$target_path' 无匹配项或无访问权限"
+        exit 0
+    fi
+
+    # 遍历匹配项：如果是目录，统计「内部」子项；如果是文件/通配符，直接统计
+    for item in "${items[@]}"; do
+        # 跳过不存在/无权限的项
+        if [ ! -e "$item" ] && [ ! -L "$item" ]; then continue; fi
+        # 核心逻辑：如果是目录，遍历其**内部**的所有子项（*/ 匹配目录内所有项）
+        if [ -d "$item" ] 2>/dev/null && [ ! -L "$item" ] 2>/dev/null; then
+            local sub_items=()
+            shopt -s nullglob globstar
+            sub_items=("$item"/*) # 匹配目录内所有子项（不含隐藏，后续过滤）
+            shopt -u nullglob globstar
+            # 遍历目录内子项，递归统计
+            for sub in "${sub_items[@]}"; do
+                count_sub_item "$sub"
+            done
+        else
+            # 不是目录（文件/软链接/通配符匹配项），直接统计
+            count_sub_item "$item"
+        fi
+    done
+
+    # 输出统计结果（彩色+清晰格式）
+    if [ $opt_only_file -eq 1 ]; then
+        echo -e "📄 仅统计文件（$hidden_note）: ${color_file}$file_count${color_reset} 个"
+        echo -e "📁 统计路径: $target_path"
+    elif [ $opt_only_dir -eq 1 ]; then
+        echo -e "📂 仅统计文件夹（$hidden_note）: ${color_dir}$dir_count${color_reset} 个"
+        echo -e "📁 统计路径: $target_path"
+    else
+        echo -e "📊 统计结果（$hidden_note）| 路径: $target_path"
+        echo -e "├─ 📂 文件夹: ${color_dir}$dir_count${color_reset} 个"
+        echo -e "└─ 📄 文件: ${color_file}$file_count${color_reset} 个"
+    fi
+    # 计数为0的友好提示
+    if [ $file_count -eq 0 ] && [ $dir_count -eq 0 ]; then
+        echo -e "⚠️  提示：无符合条件的文件/文件夹（或无访问权限）"
+    fi
+}
+
+# 子项统计函数（抽离公共逻辑，避免重复代码，支持过滤隐藏）
+count_sub_item() {
+    local sub=$1
+    # 过滤隐藏项（-n生效时，跳过名称以.开头的项）
+    if [ $opt_no_hidden -eq 1 ]; then
+        local sub_name=$(basename "$sub" 2>/dev/null) || true
+        [ "${sub_name:0:1}" = "." ] && return
+    fi
+    # 统计文件（普通文件+软链接，屏蔽权限报错）
+    if [ -f "$sub" ] 2>/dev/null || [ -L "$sub" ] 2>/dev/null; then
+        file_count=$((file_count + 1))
+    # 统计文件夹（真实目录，排除软链接目录，屏蔽权限报错）
+    elif [ -d "$sub" ] 2>/dev/null && [ ! -L "$sub" ] 2>/dev/null; then
+        dir_count=$((dir_count + 1))
+    fi
+}
+
+# 主逻辑（兜底报错，确保所有场景有输出）
+main() {
+    parse_args "$@" 2>/dev/null || true
+    handle_pipe # 优先管道模式
+    handle_path # 无管道则路径模式
+}
+
+# 执行主逻辑，捕获所有顶层报错
+main "$@" 2>/dev/null || {
+    echo -e "❌ 执行错误！请运行 \`$0 -h\` 查看正确用法"
+    exit 1
+}
