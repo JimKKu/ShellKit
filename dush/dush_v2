@@ -1,0 +1,39 @@
+#!/bin/bash
+
+# 定义显示帮助信息的函数
+show_help() {
+    echo "用途: 查看指定目录的磁盘占用大小（默认显示当前目录）"
+    echo "用法: $0 [选项/目录路径]"
+    echo ""
+    echo "选项:"
+    echo "  -h, --help    显示此帮助信息并退出"
+    echo ""
+    echo "示例:"
+    echo "  $0            查看当前目录大小"
+    echo "  $0 ./docs     查看当前目录下 docs 文件夹大小"
+    echo "  $0 /mnt/data  查看 /mnt/data 目录大小"
+}
+
+# 处理参数逻辑
+if [ $# -eq 0 ]; then
+    # 无参数时，默认使用当前目录
+    dir_path="./"
+elif [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    # 传入 -h/--help 时，显示帮助信息并退出
+    show_help
+    exit 0
+else
+    # 传入其他参数时，视为目录路径
+    dir_path="$1"
+fi
+
+# 检查目录是否存在
+if [ ! -d "$dir_path" ]; then
+    echo "错误: 目录 '$dir_path' 不存在或不是有效的目录！"
+    exit 1
+fi
+
+# 输出目录信息和大小（GB/MB 单位）
+echo "目录: $dir_path"
+du -sh "$dir_path" | awk '{print "GB 单位: " $0}'
+du -sm "$dir_path" | awk '{print "MB 单位: " $1 " MB (总计)"}'

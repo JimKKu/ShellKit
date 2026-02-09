@@ -1,0 +1,106 @@
+#!/bin/bash
+
+# 定义显示帮助信息的函数
+show_help() {
+    echo "用途: 查看指定目录的磁盘占用大小（默认显示GB/MB单位）"
+    echo "用法: $0 [选项] [目录路径]"
+    echo ""
+    echo "单位选项（可组合使用）:"
+    echo "  -g            显示GB单位"
+    echo "  -m            显示MB单位"
+    echo "  -t            显示TB单位"
+    echo "  -b            显示Byte单位"
+    echo "  -h, --help    显示此帮助信息并退出"
+    echo ""
+    echo "示例:"
+    echo "  $0            查看当前目录（默认GB+MB）"
+    echo "  $0 -g         查看当前目录（仅GB）"
+    echo "  $0 -mt /tmp   查看/tmp目录（MB+TB）"
+    echo "  $0 -gmb /data 查看/data目录（GB+MB+Byte）"
+    echo "  $0 --help     显示帮助"
+}
+
+# 初始化单位标记（默认开启GB和MB）
+show_gb=1
+show_mb=1
+show_tb=0
+show_byte=0
+dir_path="./"  # 默认目录为当前目录
+
+# 解析参数（处理选项和目录路径）
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -[gmtb]*)
+            # 重置默认单位（只要传入单位参数，就取消默认的GB+MB）
+            show_gb=0
+            show_mb=0
+            show_tb=0
+            show_byte=0
+            
+            # 解析组合选项（如 -gm、-tb 等）
+            opt="${1:1}"  # 去掉开头的-，获取选项字符
+            for ((i=0; i<${#opt}; i++)); do
+                char="${opt:i:1}"
+                case "$char" in
+                    g) show_gb=1 ;;
+                    m) show_mb=1 ;;
+                    t) show_tb=1 ;;
+                    b) show_byte=1 ;;
+                    *) 
+                        echo "错误: 无效的选项 '-$char'"
+                        show_help
+                        exit 1
+                        ;;
+                esac
+            done
+            shift
+            ;;
+        *)
+            # 非选项参数视为目录路径
+            if [ -d "$1" ]; then
+                dir_path="$1"
+                shift
+            else
+                echo "错误: 目录 '$1' 不存在或不是有效的目录！"
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+# 先获取目录的字节数（作为基础值，用于换算其他单位）
+dir_bytes=$(du -sb "$dir_path" | awk '{print $1}')
+if [ -z "$dir_bytes" ]; then
+    echo "错误: 无法获取目录 '$dir_path' 的大小信息"
+    exit 1
+fi
+
+# 输出目录信息
+echo "目录: $dir_path"
+
+# 根据标记输出对应单位
+if [ $show_gb -eq 1 ]; then
+    # 换算GB（1GB = 1024*1024*1024 Byte）
+    gb_size=$(echo "scale=2; $dir_bytes / 1024 / 1024 / 1024" | bc)
+    echo "GB 单位: $gb_size GB"
+fi
+
+if [ $show_mb -eq 1 ]; then
+    # 换算MB（1MB = 1024*1024 Byte）
+    mb_size=$(echo "scale=2; $dir_bytes / 1024 / 1024" | bc)
+    echo "MB 单位: $mb_size MB"
+fi
+
+if [ $show_tb -eq 1 ]; then
+    # 换算TB（1TB = 1024*1024*1024*1024 Byte）
+    tb_size=$(echo "scale=2; $dir_bytes / 1024 / 1024 / 1024 / 1024" | bc)
+    echo "TB 单位: $tb_size TB"
+fi
+
+if [ $show_byte -eq 1 ]; then
+    echo "Byte 单位: $dir_bytes Byte"
+fi

@@ -1,0 +1,3 @@
+#!/bin/bash
+
+dir_path="./"; echo "目录: $dir_path"; du -sh "$dir_path" | awk '{print "GB 单位: " $0}'; du -sm "$dir_path" | awk '{print "MB 单位: " $1 " MB (总计)"}'
